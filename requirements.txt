@@ -1,0 +1,8 @@
+# GDAL comes from Ubuntu packages; do not pip-install a mismatched GDAL wheel.
+fastapi==0.143.0
+uvicorn==0.54.0
+python-multipart==0.0.32
+openpyxl==3.1.5
+shapely==2.2.0
+pyproj==3.8.0
+numpy==1.26.4

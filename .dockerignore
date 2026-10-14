@@ -1,0 +1,8 @@
+.git
+__pycache__
+*.pyc
+qc_jobs
+.env
+*.gdb
+*.zip
+tests
