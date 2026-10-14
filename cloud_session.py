@@ -10,6 +10,11 @@ from urllib.parse import urlsplit
 
 COOKIE = "qc_browser_session"
 TTL = 24 * 60 * 60
+PORTAL_URL = os.environ.get("QC_PORTAL_URL", "https://harikrishnanpnair-alt.github.io/gis-processing-portal/")
+_portal = urlsplit(PORTAL_URL)
+if _portal.scheme not in {"http", "https"} or not _portal.netloc or _portal.username or _portal.password:
+    raise RuntimeError("QC_PORTAL_URL must be the public frontend website URL.")
+FRONTEND_ORIGIN = _portal.scheme + "://" + _portal.netloc
 
 
 def secret():
@@ -47,6 +52,15 @@ def browser_origin(request):
         return external
     scheme = "https" if os.environ.get("RENDER") == "true" else request.url.scheme
     return scheme + "://" + request.url.netloc
+
+
+def new_token(existing=""):
+    sid = session_id(existing)
+    if sid is None:
+        sid = secrets.token_hex(32)
+    expires = int(time.time()) + TTL
+    payload = sid + "." + str(expires)
+    return payload + "." + signature(payload), expires
 
 
 def issue_cookie(response, request):

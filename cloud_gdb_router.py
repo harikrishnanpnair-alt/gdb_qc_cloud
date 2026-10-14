@@ -16,9 +16,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from typing import List, Optional
 from fastapi import APIRouter, File, UploadFile, HTTPException, Depends, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from cloud_session import COOKIE, session_id, owner_id, browser_origin
+from cloud_session import COOKIE, session_id, owner_id, browser_origin, FRONTEND_ORIGIN, new_token
 
 ROOT = Path(os.environ.get("QC_JOB_ROOT", str(Path(__file__).parent / "qc_jobs"))).resolve()
 ROOT.mkdir(parents=True, exist_ok=True)
@@ -35,19 +35,30 @@ LOCK = threading.RLock()
 router = APIRouter(prefix="/gdb", tags=["Cloud GDB QC"])
 
 
+def check_origin(request: Request):
+    origin = request.headers.get("Origin")
+    allowed = {x.strip().rstrip("/") for x in os.environ.get("QC_ALLOWED_ORIGINS", "").split(",") if x.strip()}
+    allowed.update({FRONTEND_ORIGIN, browser_origin(request)})
+    if origin and origin not in allowed and "*" not in allowed:
+        raise HTTPException(403, "This frontend origin is not allowed by the QC service.")
+    return origin
+
+
 def authorize(request: Request):
     if not API_KEY:
         raise HTTPException(503, "QC_API_KEY must be configured on the server before use.")
-    origin = request.headers.get("Origin")
-    allowed = {x.strip() for x in os.environ.get("QC_ALLOWED_ORIGINS", "").split(",") if x.strip()}
-    allowed.add(browser_origin(request))
-    if origin and origin not in allowed and "*" not in allowed:
-        raise HTTPException(403, "This frontend origin is not allowed by the QC service.")
+    origin = check_origin(request)
     key = request.headers.get("X-GDB-Key", "")
     if key:
         if hmac.compare_digest(key.encode("utf-8"), API_KEY.encode("utf-8")):
             return "api-key"
         raise HTTPException(401, "Invalid QC API key.")
+    token = request.headers.get("X-QC-Session", "")
+    if token:
+        sid = session_id(token)
+        if sid is None:
+            raise HTTPException(401, "Your QC session expired. Reload the portal and load your GDBs again.")
+        return owner_id(sid)
     sid = session_id(request.cookies.get(COOKIE, ""))
     if sid is None:
         raise HTTPException(401, "Open or reload the cloud portal to start your browser session.")
@@ -255,6 +266,18 @@ class QCRequest(BaseModel):
     schema_upload_id: str
     short_limit_m: float = Field(default=2.0, gt=0, le=100000)
     selected: Optional[List[str]] = Field(default=None, min_length=1, max_length=1000)
+
+
+@router.post("/session")
+def browser_session(request: Request):
+    # Anonymous trial bootstrap. The master API key remains on the server.
+    check_origin(request)
+    existing = request.headers.get("X-QC-Session", "")
+    if not existing and request.headers.get("Origin") in {None, browser_origin(request)}:
+        existing = request.cookies.get(COOKIE, "")
+    token, expires = new_token(existing)
+    return JSONResponse({"session_token": token, "expires_at": expires},
+                        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 
 @router.get("/health", dependencies=[Depends(authorize)])

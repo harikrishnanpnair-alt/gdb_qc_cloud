@@ -4,10 +4,10 @@ import os
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from cloud_gdb_router import router, restore_job_states, MAX_UPLOAD, authorize
 from cloud_gdb_worker import engine_health
-from cloud_session import issue_cookie
+from cloud_session import issue_cookie, FRONTEND_ORIGIN, PORTAL_URL
 
 
 @asynccontextmanager
@@ -20,7 +20,10 @@ async def lifespan(app):
 
 
 app = FastAPI(title="Open-source GDB QC", lifespan=lifespan)
-origins = [x.strip() for x in os.environ.get("QC_ALLOWED_ORIGINS", "").split(",") if x.strip()]
+origins = [x.strip().rstrip("/") for x in os.environ.get("QC_ALLOWED_ORIGINS", "").split(",") if x.strip()]
+origins.append(FRONTEND_ORIGIN)
+if os.environ.get("RENDER_EXTERNAL_URL"):
+    origins.append(os.environ["RENDER_EXTERNAL_URL"].rstrip("/"))
 
 
 
@@ -30,7 +33,7 @@ class UploadLimit:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope.get("path", "").startswith("/gdb/") and scope.get("method") != "OPTIONS":
+        if scope["type"] == "http" and scope.get("path", "").startswith("/gdb/") and scope.get("method") != "OPTIONS" and scope.get("path") != "/gdb/session":
             try:
                 authorize(Request(scope))
             except HTTPException as exc:
@@ -58,7 +61,7 @@ class UploadLimit:
 
 app.add_middleware(UploadLimit)
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=False,
-                   allow_methods=["GET", "POST"], allow_headers=["Content-Type", "X-GDB-Key"])
+                   allow_methods=["GET", "POST"], allow_headers=["Content-Type", "X-GDB-Key", "X-QC-Session"])
 app.include_router(router)
 
 
@@ -69,7 +72,11 @@ def readiness():
 
 @app.get("/", include_in_schema=False)
 def index(request: Request):
-    response = FileResponse(Path(__file__).with_name("index.html"), media_type="text/html")
+    page = Path(__file__).with_name("index.html")
+    if not page.is_file():
+        # The frontend can live in the main GitHub Pages repository.
+        return RedirectResponse(PORTAL_URL, status_code=307)
+    response = FileResponse(page, media_type="text/html")
     return issue_cookie(response, request)
 
 
