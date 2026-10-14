@@ -15,6 +15,7 @@ from shapely.ops import transform as transform_geometry
 from pyproj import CRS, Transformer
 from cloud_gdb_common import open_gdb, inventory, resolve_schema, layer_definition, layer_fields
 from report_style import format_sheet
+from curve_geometry import curve_digest, shape_for_length, ARC_STEP_DEGREES
 
 MAX_FEATURES = int(os.environ.get("QC_MAX_TOTAL_FEATURES", "250000"))
 DETAIL_LIMIT = int(os.environ.get("QC_MAX_DETAIL_ROWS", "50000"))
@@ -119,7 +120,7 @@ def compare_schema(source_layer, target_layer, source_meta, target_meta):
 
 def geometry_from_ogr(geometry):
     if geometry.HasCurveGeometry():
-        raise ValueError("Curved geometry: short-line and duplicate checks are not evaluated by this version.")
+        raise ValueError("Curved geometry must use the native curve check path.")
     result = shapely.from_wkb(bytes(geometry.ExportToIsoWkb()))
     if ogr.GT_HasM(geometry.GetGeometryType()) and not shapely.has_m(result):
         raise ValueError("Measured geometry could not retain M values for duplicate comparison.")
@@ -146,11 +147,14 @@ def run_qc(input_gdb, schema_gdb, output_excel, short_limit=2.0, selected=None, 
     headers = ["Feature Class", "Geometry", "Records", "Fields With Nulls/Blanks", "Null Cells", "Blank Cells", "Short Lines", "Exact Duplicate Extras", "Empty Geometry", "Domain Violations", "Schema Issues", "Status", "Acquisition_Method Values", "Data_Source Values", "Open Detail"]
     summary.append(headers)
     coverage = wb.create_sheet("Check_Coverage"); coverage.append(["Feature Class", "Check", "Reason"])
+    curve_notes = wb.create_sheet("Curve_Processing"); curve_notes.append(["Feature Class", "Curved Features", "Short-Line Method", "Duplicate Method"])
     notes = wb.create_sheet("Run_Details"); notes.append(["Setting", "Value"])
     notes.append(["Engine", "GDAL " + gdal.VersionInfo("RELEASE_NAME") + "; OGR/OpenFileGDB; Shapely " + shapely.__version__])
     notes.append(["Short-line threshold (m)", short_limit])
     notes.append(["Short-line length", "Geodesic XY length on the input CRS ellipsoid, using its inverse projection. No datum transformation to WGS84 is applied."])
     notes.append(["Duplicate rule", "Exact normalized geometry WKB, preserving XY/Z/M when supported. Direction/part order normalized; first encountered FID is the original. ArcGIS XY/Z snapping tolerance is NOT applied; results may differ from FindIdentical."])
+    notes.append(["Curved feature length", "GDAL arc approximation at maximum " + str(ARC_STEP_DEGREES) + " degrees per arc step, then geodesic XY length. Reported lengths are approximate; originals are read-only."])
+    notes.append(["Curved feature duplicates", "Exact arc/line control records as exposed by OGR, preserving its XY/Z/M values, normalizing direction, ring start at stored segment boundaries, and part/hole order. Different control points representing the same mathematical curve, or a curve versus a densified straight representation, may not match. No curve flattening is used for duplicate comparison."])
     notes.append(["Issue indicators", "Null-field counts are indicators; null/blank cells are separate measures. Totals are not counts of distinct affected features."])
     notes.append(["Details limit", "At most " + str(DETAIL_LIMIT) + " detail rows for the workbook; summary counts include all scanned records. Truncation is listed on Check_Coverage."])
     notes.append(["Outside scope", "Topology rules, network connectivity, relationship/attachment integrity, nonspatial tables and project-specific rules outside the reference schema are not checked."])
@@ -208,7 +212,7 @@ def run_qc(input_gdb, schema_gdb, output_excel, short_limit=2.0, selected=None, 
             domain_count = 0
         except Exception as exc:
             incomplete("Schema/domains", exc)
-        empty_count = short_count = duplicate_count = 0
+        empty_count = short_count = duplicate_count = curved_count = 0
         seen_geometry = {}
         native_geom_type = ogr.GT_Flatten(layer.GetGeomType())
         is_line = native_geom_type in {ogr.wkbLineString, ogr.wkbMultiLineString, ogr.wkbCircularString, ogr.wkbCompoundCurve, ogr.wkbMultiCurve}
@@ -264,31 +268,33 @@ def run_qc(input_gdb, schema_gdb, output_excel, short_limit=2.0, selected=None, 
             geometry = feature.GetGeometryRef()
             if geometry is None or geometry.IsEmpty():
                 empty_count += 1; detail("Empty", [oid]); continue
+            curved = bool(geometry.HasCurveGeometry())
+            if curved:
+                curved_count += 1
+            # These checks run independently: a length-conversion failure does
+            # not discard a valid native curve duplicate comparison.
             try:
-                shape = geometry_from_ogr(geometry)
-            except Exception as exc:
-                incomplete("Exact duplicates", exc)
-                if is_line:
-                    incomplete("Short lines", exc)
-                continue
-            if is_line and length is not None:
-                try:
-                    metres = length(shape)
-                    if not math.isfinite(metres):
-                        raise ValueError("Geodesic length is not finite.")
-                    if metres < short_limit:
-                        short_count += 1; detail("Short", [oid, metres])
-                except Exception as exc:
-                    incomplete("Short lines", exc)
-            try:
-                canonical = shapely.to_wkb(shapely.normalize(shape), byte_order=1, output_dimension=4)
-                digest = hashlib.sha256(canonical).digest()
+                if curved:
+                    digest = curve_digest(geometry)
+                else:
+                    shape = geometry_from_ogr(geometry)
+                    canonical = shapely.to_wkb(shapely.normalize(shape), byte_order=1, output_dimension=4)
+                    digest = hashlib.sha256(canonical).digest()
                 if digest in seen_geometry:
                     duplicate_count += 1; detail("Duplicates", [oid, seen_geometry[digest]])
                 else:
                     seen_geometry[digest] = oid
             except Exception as exc:
                 incomplete("Exact duplicates", exc)
+            if is_line and length is not None:
+                try:
+                    metres = length(shape_for_length(geometry))
+                    if not math.isfinite(metres):
+                        raise ValueError("Geodesic length is not finite.")
+                    if metres < short_limit:
+                        short_count += 1; detail("Short", [oid, metres, "CURVE APPROXIMATION" if curved else "Geodesic XY"])
+                except Exception as exc:
+                    incomplete("Short lines", exc)
         null_rows = [[f["name"], f["alias"], f["type"], counts[0], counts[1]] for f, counts in zip(input_fields, nulls) if any(counts)]
         for row in null_rows:
             detail("Nulls", row)
@@ -304,7 +310,13 @@ def run_qc(input_gdb, schema_gdb, output_excel, short_limit=2.0, selected=None, 
             coverage.append([item["path"], check, reason])
         for kind, omitted in truncations.items():
             coverage.append([item["path"], kind + " detail output", str(omitted) + " detail rows omitted; summary counts are complete."])
-        definitions = {"Nulls": ["Field", "Alias", "Type", "Null Count", "Blank Count"], "Short": ["FID", "Length (m)"],
+        processing_notes = []
+        if curved_count:
+            short_method = ("Geodesic XY after GDAL arc approximation at " + str(ARC_STEP_DEGREES) + " degrees per step") if is_line else "Not a line class"
+            duplicate_method = "Native curve control records as read by GDAL/OGR; XY/Z/M included; direction/ring start/part order normalized; no flattening or tolerance. Equivalent curves with different control records may not match."
+            curve_notes.append([item["path"], curved_count, short_method, duplicate_method])
+            processing_notes.append(str(curved_count) + " curved features: " + ("lengths approximated; " if is_line else "") + "duplicates compared using stored curve control records. See Curve_Processing in Excel.")
+        definitions = {"Nulls": ["Field", "Alias", "Type", "Null Count", "Blank Count"], "Short": ["FID", "Length (m)", "Method"],
                        "Duplicates": ["Duplicate FID", "Original FID"], "Empty": ["FID"],
                        "Schema": ["Field", "Issue", "Actual", "Expected"], "Domains": ["FID", "Field", "Value", "Domain", "Issue"]}
         sheet_names = []
@@ -325,10 +337,10 @@ def run_qc(input_gdb, schema_gdb, output_excel, short_limit=2.0, selected=None, 
         results.append({"path": item["path"], "geometry": item["geometry"], "records": records, **metrics,
                         "status": status, "known_issue_indicators": total,
                         "check_failures": [{"check": k, "error": v} for k, v in errors.items()],
-                        "omitted_detail_rows": dict(truncations)})
+                        "omitted_detail_rows": dict(truncations), "curved_features": curved_count, "processing_notes": processing_notes})
         if progress:
             progress((index+1)/len(input_items), "Checked " + item["path"])
-    for ws in (executive, summary, coverage, notes):
+    for ws in (executive, summary, coverage, curve_notes, notes):
         format_sheet(ws)
     for ws, column in [(executive, 2), (summary, 12)]:
         for row in ws.iter_rows(min_row=2):
@@ -338,5 +350,5 @@ def run_qc(input_gdb, schema_gdb, output_excel, short_limit=2.0, selected=None, 
     wb.save(output_excel)
     source_ds = schema_ds = None
     return {"engine": "GDAL/OGR", "classes": results, "status_counts": dict(Counter(r["status"] for r in results)),
-            "has_warnings": any(r["status"] == "INCOMPLETE" or r["omitted_detail_rows"] for r in results),
-            "short_limit_m": short_limit, "duplicate_rule": "Exact normalized geometry, without ArcGIS snapping tolerance"}
+            "has_warnings": any(r["status"] == "INCOMPLETE" or r["omitted_detail_rows"] or r["processing_notes"] for r in results),
+            "short_limit_m": short_limit, "duplicate_rule": "Straight features: exact normalized WKB; curves: exact stored control records. No ArcGIS snapping tolerance.", "curve_arc_step_degrees": ARC_STEP_DEGREES}

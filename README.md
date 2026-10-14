@@ -2,6 +2,18 @@
 
 This package replaces the GDB QC ArcPy engine with Python, GDAL/OGR OpenFileGDB, Shapely and pyproj. It runs on a Linux cloud server. Users upload two ZIP files through the browser and download an Excel report. No ArcGIS installation or Windows Python clone is required for QC.
 
+## Curved geometry update
+
+The uploaded QC report identified curves as the cause of incomplete checks in AccessRoutes, OtherAreaFeatures, OtherlineFeatures, Structure_line and Structure_Outline. This update adds `curve_geometry.py` and modifies `cloud_qc.py` to process supported circular strings, compound curves, curve polygons and multipart curve containers.
+
+For this update, replace the backend files using the included package, including the **new `curve_geometry.py`** module. The key changed backend files are `cloud_qc.py` and `curve_geometry.py`. Replace the frontend index as well to show processing/failure notes directly in the result table. Keep the existing Render key and repository connection, redeploy, and rerun QC. The old workbook cannot be recalculated without the actual GDB inputs.
+
+- Curved line lengths use a private GDAL line approximation with maximum **0.25 degrees per arc step**, followed by geodesic XY measurement. These lengths are approximate and identified in `Curve_Processing`, `Run_Details` and short-feature detail sheets. The uploaded GDBs remain read-only.
+- Curved duplicates compare exact native arc/line control records **as returned by GDAL/OGR**, including its XY/Z/M coordinates. Direction, ring starts at stored segment boundaries, part order and hole order are normalized. The length approximation is never used for duplicate matching.
+- Curves with different control records representing the same mathematical curve, and native curves versus already-densified straight geometry, may not match. GDAL's reconstructed curve control ordinates can depend on the driver; validation against an ArcGIS-created Z/M curve dataset is still needed. The update does not claim identical ArcGIS FindIdentical behavior.
+- Curved features no longer fail solely because they are curved. Unsupported/invalid geometry, excessive line-measurement point counts or other failed checks still produce `INCOMPLETE`, with reasons. Approximation/method notes are shown separately and can produce a completed-with-warnings job without an INCOMPLETE class.
+- The actual input/reference GDBs have not been supplied; this update passed real synthetic curved File GDB tests but has not recomputed the uploaded project report. Rerun the portal with those GDBs after deployment.
+
 ## Separate frontend and cloud QC backend
 
 | Component | Website | GitHub repository |
@@ -40,8 +52,8 @@ The conversion/profile API remains `https://gis-processing-backend.onrender.com`
 | Check | Rule |
 |---|---|
 | Nulls and blanks | Separate counts per field and totals; numeric zero is a value, not a null. System/binary/GlobalID fields are excluded. |
-| Short lines | Total feature XY geodesic length in metres on the input CRS ellipsoid, below the selected threshold. Default 2 m. This is not a test of each vertex-to-vertex segment. |
-| Exact duplicates | Normalized WKB, retaining XY/Z/M where supported; line direction and part order normalized. Each feature after the first matching geometry counts as one extra. Attributes are not part of this comparison. |
+| Short lines | Total feature XY geodesic length in metres on the input CRS ellipsoid, below the selected threshold. Curves are approximated at 0.25 degrees per arc step. Default threshold 2 m; this is not a check of individual vertex-to-vertex segments. |
+| Exact duplicates | Straight features: normalized WKB. Curves: native arc/line control records returned by OGR, including XY/Z/M. Direction/ring start/part order normalized. Extras counted after the first matching feature; attributes excluded. Different curve representations may not match. |
 | Empty geometry | Missing or empty shape. |
 | Schema | Required reference fields, types, string lengths, nullable flags, domain assignments, geometry/Z/M and CRS. Extra input fields are allowed. |
 | Domains | Values checked against reference coded-value and numeric range domains; descriptions are flagged when a code is expected. Nulls are handled in the null check. |
@@ -53,11 +65,11 @@ Workbook styling follows the earlier blue-header QC report. Known issue indicato
 
 ## Differences and limits
 
-- Exact duplicate results can differ from ArcGIS `FindIdentical`: ArcGIS XY/Z snapping tolerance is not applied. Curves are not silently linearized; affected short-line and duplicate checks are incomplete.
+- Exact duplicate results can differ from ArcGIS `FindIdentical`: ArcGIS XY/Z snapping tolerance is not applied. Curve lengths are explicitly approximated; curve duplicate matching uses native control records, not the approximation. Unsupported or invalid curve geometry remains incomplete.
 - Unknown or unsupported CRS prevents a valid short-line check. Non-numeric range and glob domains are not implemented. Metadata failures are reported.
 - Topology rules, connectivity/networks, relationship and attachment integrity, nonspatial tables, raster layers, and project-specific rules not represented by the reference schema are outside this first version.
 - The Docker image uses Ubuntu 24.04 GDAL (tested here with 3.8.4). 64-bit OBJECTID geodatabases need a newer, separately validated GDAL build; this package is for ordinary 32-bit OBJECTID GDBs. GDAL also documents restrictions on SDC/CDF compressed data. See https://gdal.org/en/stable/drivers/vector/openfilegdb.html.
-- Pilot defaults: 128 MB per ZIP, 1 GB extracted per GDB, 250,000 selected features, 50,000 workbook detail rows, 10 admitted jobs, one processing job at a time and 30-minute processing timeout. Full summary counts are retained when detail rows are capped; omitted-row counts appear in `Check_Coverage`.
+- Pilot defaults: 128 MB per ZIP, 1 GB extracted per GDB, 250,000 selected features, 50,000 workbook detail rows, 10 admitted jobs, one processing job at a time and 30-minute processing timeout. Line measurement is limited to 250,000 points per feature. Full summary counts are retained when detail rows are capped; omitted-row counts appear in `Check_Coverage`.
 - Private GDB copies can use substantial disk space. Start with small files, measure memory/disk use and choose cloud resources based on your own data. The Docker image has not been built or deployed to Render from this workspace.
 - Jobs/uploads/results use local server disk. Completed job folders expire after 24 hours, with cleanup triggered on a new submission. Restarted in-flight jobs become failed; on ephemeral hosting, redeployment may also remove uploads/results. Download promptly.
 - This is a public trial with browser-session job separation, not per-user accounts or billing limits. It is not a validated 100-user deployment. Administrative API-key requests can access all jobs. Multiple web workers/instances need an external queue and job store; do not increase `--workers` on this implementation.
@@ -72,6 +84,7 @@ Workbook styling follows the earlier blue-header QC report. Known issue indicato
 - `cloud_gdb_worker.py`: isolated processing process.
 - `cloud_gdb_common.py`: read-only GDB inventory and layer XML metadata.
 - `cloud_qc.py`: QC calculations and Excel/JSON result data.
+- `curve_geometry.py`: curve control-record matching and private XY approximations for length checks.
 - `report_style.py`: Excel formatting.
 - `Dockerfile`, `.dockerignore`, `requirements.txt`: cloud environment.
 
